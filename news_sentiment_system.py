@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
@@ -1358,4 +1356,5 @@ def main():
             print("Invalid choice. Please enter a number between 1-7.")
 
 if __name__ == "__main__":
+
     main()
