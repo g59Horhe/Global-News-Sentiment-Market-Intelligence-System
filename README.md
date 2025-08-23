@@ -5,7 +5,7 @@ A comprehensive news sentiment analysis system using mixed scraping methods (Sel
 ## Features
 
 - **Mixed Method Scraping**: Combines Selenium for dynamic content and Requests for static content
-- **8 News Sources**: BBC, Reuters, Guardian, CNN, Al Jazeera, NPR, Deutsche Welle, Washington Post  
+- **4 News Sources**: AP, CNN, BBC, The Guardian
 - **Advanced Sentiment Analysis**: NLTK-based sentiment scoring with keyword extraction
 - **Comprehensive Visualizations**: 12-panel dashboard with method comparison
 - **Tableau Integration**: Export-ready datasets for advanced analytics
