@@ -15,19 +15,25 @@ from typing import List, Dict, Optional
 import sqlite3
 from collections import Counter
 import warnings
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 warnings.filterwarnings('ignore')
 
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
+from selenium.webdriver.chrome.service import Service
+
 try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.common.action_chains import ActionChains
-    from selenium.common.exceptions import TimeoutException, NoSuchElementException
-    SELENIUM_AVAILABLE = True
+    from webdriver_manager.chrome import ChromeDriverManager
+    WEBDRIVER_MANAGER_AVAILABLE = True
 except ImportError:
-    SELENIUM_AVAILABLE = False
+    WEBDRIVER_MANAGER_AVAILABLE = False
+    print("⚠️  webdriver-manager not found. Install with: pip install webdriver-manager")
 
 import matplotlib.pyplot as plt
 try:
@@ -57,6 +63,7 @@ try:
 except ImportError:
     NLTK_AVAILABLE = False
 
+
 @dataclass
 class NewsArticle:
     title: str
@@ -66,26 +73,28 @@ class NewsArticle:
     published_date: str
     author: str
     category: str
-    scraping_method: str = "requests"
     sentiment_score: float = 0.0
     sentiment_label: str = "neutral"
     keywords: List[str] = None
 
+
 class NewsScrapingError(Exception):
     pass
 
+
 class SimpleSentimentAnalyzer:
-    
     def __init__(self):
         self.positive_words = {
             'good', 'great', 'excellent', 'amazing', 'wonderful', 'fantastic', 'positive',
             'success', 'win', 'growth', 'increase', 'rise', 'gain', 'improve', 'better',
-            'strong', 'confident', 'optimistic', 'breakthrough', 'achievement'
+            'strong', 'confident', 'optimistic', 'breakthrough', 'achievement', 'boost',
+            'surge', 'soar', 'rally', 'expand', 'advance', 'progress', 'victory'
         }
         self.negative_words = {
             'bad', 'terrible', 'awful', 'horrible', 'negative', 'fail', 'failure',
             'decline', 'decrease', 'fall', 'drop', 'loss', 'worse', 'crisis',
-            'problem', 'issue', 'concern', 'worry', 'pessimistic', 'disaster'
+            'problem', 'issue', 'concern', 'worry', 'pessimistic', 'disaster',
+            'crash', 'plunge', 'tumble', 'collapse', 'threat', 'risk', 'danger'
         }
     
     def polarity_scores(self, text):
@@ -99,9 +108,10 @@ class SimpleSentimentAnalyzer:
         
         pos_score = positive_count / total_words
         neg_score = negative_count / total_words
-        neu_score = 1.0 - pos_score - neg_score
+        neu_score = max(0, 1.0 - pos_score - neg_score)
         
-        compound = pos_score - neg_score
+        compound = (pos_score - neg_score) * 2
+        compound = max(-1, min(1, compound))
         
         return {
             'compound': compound,
@@ -110,1251 +120,1294 @@ class SimpleSentimentAnalyzer:
             'neg': neg_score
         }
 
-class SeleniumManager:
-    
-    def __init__(self):
-        self.driver = None
-        self.setup_driver()
-    
-    def setup_driver(self):
-        if not SELENIUM_AVAILABLE:
-            raise ImportError("Selenium not available.")
-        
-        options = Options()
-        options.add_argument('--headless')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--window-size=1920,1080')
-        options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
-        
-        options.add_argument('--disable-blink-features=AutomationControlled')
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option('useAutomationExtension', False)
-        
-        self.driver = webdriver.Chrome(options=options)
-        self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    
-    def get_page_selenium(self, url: str, wait_time: int = 10) -> BeautifulSoup:
-        try:
-            self.driver.get(url)
-            
-            WebDriverWait(self.driver, wait_time).until(
-                lambda driver: driver.execute_script("return document.readyState") == "complete"
-            )
-            
-            time.sleep(random.uniform(2, 4))
-            
-            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
-            
-            page_source = self.driver.page_source
-            return BeautifulSoup(page_source, 'html.parser')
-            
-        except Exception as e:
-            raise NewsScrapingError(f"Selenium error for {url}: {str(e)}")
-    
-    def close(self):
-        if self.driver:
-            self.driver.quit()
 
-class EnhancedNewsScraper:
-    
-    def __init__(self, max_articles_per_source: int = 25):
+class FastSeleniumNewsScraper:
+    def __init__(self, max_articles_per_source: int = 60, headless: bool = True, max_workers: int = 6):
         self.max_articles_per_source = max_articles_per_source
+        self.headless = headless
+        self.max_workers = max_workers
+        self.drivers = []
+        self.current_driver_index = 0
+        self.driver_lock = threading.Lock()
         
-        if SELENIUM_AVAILABLE:
-            try:
-                self.selenium_manager = SeleniumManager()
-            except Exception:
-                self.selenium_manager = None
-        else:
-            self.selenium_manager = None
-        
-        self.sessions = self.create_multiple_sessions()
-        self.current_session_index = 0
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('selenium_news_scraping.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
         
         if NLTK_AVAILABLE:
             self.sia = SentimentIntensityAnalyzer()
             self.lemmatizer = WordNetLemmatizer()
         else:
             self.sia = SimpleSentimentAnalyzer()
-            self.lemmatizer = None
         
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('enhanced_scraping.log'),
-                logging.StreamHandler()
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
-        
+        self.init_drivers(self.max_workers)
         self.init_database()
         
-        self.selenium_sources = {
-            'ap': {
-                'base_url': 'https://apnews.com',
-                'sections': ['world-news', 'business', 'technology'],
-                'section_urls': {
-                    'world-news': 'https://apnews.com/hub/world-news',
-                    'business': 'https://apnews.com/hub/business',
-                    'technology': 'https://apnews.com/hub/technology'
-                },
-                'selectors': {
-                    'article_links': 'a[href*="/article/"]',
-                    'title': 'h1, .Page-headline, [data-key="card-headline"]',
-                    'content': '.RichTextStoryBody p, .Article p, div[data-key="article"] p, .main p',
-                    'date': 'time, .Timestamp, [data-key="timestamp"]',
-                    'author': '.Component-bylines, [data-key="byline"], .Byline'
-                }
-            },
-            'cnn': {
-                'base_url': 'https://edition.cnn.com',
-                'sections': ['world', 'business', 'tech'],
-                'section_urls': {
-                    'world': 'https://edition.cnn.com/world',
-                    'business': 'https://edition.cnn.com/business',
-                    'tech': 'https://edition.cnn.com/business/tech'
-                },
-                'selectors': {
-                    'article_links': 'a[href*="/2024/"], a[href*="/2025/"]',
-                    'title': 'h1, .headline__text, .pg-headline, [data-zn-id="headline"], .Article__title',
-                    'content': '.zn-body__paragraph, .el-editorial-source p, p[data-zn-id="paragraph"], .l-container p, .pg-body p, .BasicArticle__main p, .Article__content p, div[data-zn-id="paragraph"], .wysiwyg p, article p, .body-text p',
-                    'date': '.timestamp, time, .metadata__date, [data-zn-id="timestamp"]',
-                    'author': '.byline__names, .metadata__byline, .BasicArticle__byline, [data-zn-id="byline"]'
-                }
-            }
-        }
-        
-        self.requests_sources = {
+        self.news_sources = {
             'bbc': {
-                'base_url': 'https://www.bbc.com/news',
-                'sections': ['world', 'business', 'technology'],
+                'base_urls': [
+                    'https://www.bbc.com/news',
+                    'https://www.bbc.com/news/world',
+                    'https://www.bbc.com/news/business',
+                    'https://www.bbc.com/news/technology',
+                    'https://www.bbc.com/news/politics',
+                    'https://www.bbc.com/news/health'
+                ],
                 'selectors': {
-                    'article_links': 'a[href*="/news/articles/"], a[href*="/news/world-"], a[href*="/news/business-"], a[href*="/news/technology-"]',
-                    'title': 'h1, .story-body__h1, #main-heading',
-                    'content': '[data-component="text-block"] p, article p, .story-body p, .story-body__inner p, main p, .gel-body-copy',
-                    'date': 'time, .date, [data-datetime]',
-                    'author': '.byline__name, [rel="author"], .story-body__byline'
+                    'article_links': [
+                        'a[data-testid="internal-link"]',
+                        'a[href*="/news/"]',
+                        'h3 a',
+                        '.media__link',
+                        '.gs-c-promo-heading a',
+                        '.gel-layout a',
+                        'a[href*="2025"]',
+                        'a[href*="2024"]',
+                        '.nw-c-promo a',
+                        '.gs-c-promo a',
+                        '.media-list__item a',
+                        '[data-testid="card-headline"] a',
+                        '.block-link a',
+                        '.media a',
+                        '.promo a',
+                        '.story-promo a'
+                    ],
+                    'title': [
+                        'h1[data-testid="headline"]',
+                        'h1',
+                        '.story-body__h1',
+                        '.headline',
+                        '.article-headline__text'
+                    ],
+                    'content': [
+                        '[data-component="text-block"] p',
+                        '.story-body__inner p',
+                        '.gel-body-copy',
+                        'article p',
+                        '.story-body p',
+                        '.rich-text p'
+                    ],
+                    'date': [
+                        'time[datetime]',
+                        '[data-testid="timestamp"]',
+                        '.date',
+                        'time'
+                    ],
+                    'author': [
+                        '[data-testid="byline-name"]',
+                        '.byline__name',
+                        '[rel="author"]',
+                        '.story-body__byline',
+                        '.author'
+                    ]
                 }
             },
             'guardian': {
-                'base_url': 'https://www.theguardian.com',
-                'sections': ['world', 'business', 'technology'],
+                'base_urls': [
+                    'https://www.theguardian.com/world',
+                    'https://www.theguardian.com/business',
+                    'https://www.theguardian.com/technology',
+                    'https://www.theguardian.com/international',
+                    'https://www.theguardian.com/uk-news',
+                    'https://www.theguardian.com/politics'
+                ],
                 'selectors': {
-                    'article_links': 'a[href*="/2025/aug/"], a[href*="/2025/jul/"], a[href*="/2025/jun/"], a[href*="/2024/aug/"], a[href*="/2024/jul/"], a[href*="/2024/jun/"], a[href*="/2024/"], a[href*="/2025/"]',
-                    'title': 'h1, .content__headline',
-                    'content': '.content__article-body p, .article-body p, #maincontent p, .content__main p',
-                    'date': 'time, .content__dateline time',
-                    'author': '.byline a, .content__meta-container .contributor-full'
+                    'article_links': [
+                        'a[data-link-name="article"]',
+                        'a[href*="/2025/"]',
+                        'a[href*="/2024/"]',
+                        '.fc-item__link',
+                        '.u-faux-block-link__overlay',
+                        'h3 a',
+                        '.headline a',
+                        '.fc-item a',
+                        '.content__headline a',
+                        'a[data-component="GuardianLines"]',
+                        '.dcr-lv2v9o a',
+                        'article a',
+                        'a[href*="/commentisfree/"]',
+                        'a[href*="theguardian.com/"]'
+                    ],
+                    'title': [
+                        'h1[data-gu-name="headline"]',
+                        'h1',
+                        '.content__headline',
+                        '.article-header h1'
+                    ],
+                    'content': [
+                        '.content__article-body p',
+                        '.article-body p',
+                        '#maincontent p',
+                        '.content__main p',
+                        'article p'
+                    ],
+                    'date': [
+                        'time[datetime]',
+                        '.content__dateline time',
+                        '.timestamp',
+                        'time'
+                    ],
+                    'author': [
+                        '[data-component="meta-byline"] a',
+                        '.byline a',
+                        '.content__meta-container .contributor-full',
+                        '.author-name'
+                    ]
                 }
             },
             'ap': {
-                'base_url': 'https://apnews.com',
-                'sections': ['world-news', 'business', 'technology'],
-                'section_urls': {
-                    'world-news': 'https://apnews.com/hub/world-news',
-                    'business': 'https://apnews.com/hub/business',
-                    'technology': 'https://apnews.com/hub/technology'
-                },
+                'base_urls': [
+                    'https://apnews.com',
+                    'https://apnews.com/hub/world-news',
+                    'https://apnews.com/hub/business',
+                    'https://apnews.com/hub/technology',
+                    'https://apnews.com/world-news'
+                ],
                 'selectors': {
-                    'article_links': 'a[href*="/article/"]',
-                    'title': 'h1, .Page-headline, [data-key="card-headline"]',
-                    'content': '.RichTextStoryBody p, .Article p, div[data-key="article"] p, .main p',
-                    'date': 'time, .Timestamp, [data-key="timestamp"]',
-                    'author': '.Component-bylines, [data-key="byline"], .Byline'
+                    'article_links': [
+                        'a[href*="/article/"]',
+                        'a[data-key="card-headline"]',
+                        '.Component-headline a',
+                        'h3 a',
+                        '.PagePromo-title a',
+                        '.CardHeadline a',
+                        'a[href*="/hub/"]',
+                        '.Link a',
+                        'article a'
+                    ],
+                    'title': [
+                        'h1[data-key="card-headline"]',
+                        'h1',
+                        '.Page-headline',
+                        '.Article-headline',
+                        '.PagePromo-title'
+                    ],
+                    'content': [
+                        '.RichTextStoryBody p',
+                        '.Article p',
+                        'div[data-key="article"] p',
+                        '.main p',
+                        'article p',
+                        '.story-body p'
+                    ],
+                    'date': [
+                        'bsp-timestamp',
+                        'time[data-source="ap"]',
+                        '.Timestamp',
+                        'time',
+                        '[data-key="timestamp"]'
+                    ],
+                    'author': [
+                        '.Component-bylines',
+                        '[data-key="byline"]',
+                        '.Byline',
+                        '.byline'
+                    ]
                 }
             },
             'cnn': {
-                'base_url': 'https://edition.cnn.com',
-                'sections': ['world', 'business', 'tech'],
-                'section_urls': {
-                    'world': 'https://edition.cnn.com/world',
-                    'business': 'https://edition.cnn.com/business',
-                    'tech': 'https://edition.cnn.com/business/tech'
-                },
+                'base_urls': [
+                    'https://www.cnn.com/world',
+                    'https://www.cnn.com/business',
+                    'https://www.cnn.com/tech',
+                    'https://www.cnn.com',
+                    'https://edition.cnn.com',
+                    'https://www.cnn.com/politics'
+                ],
                 'selectors': {
-                    'article_links': 'a[href*="/2024/"], a[href*="/2025/"]',
-                    'title': 'h1, .headline__text, .pg-headline, [data-zn-id="headline"], .Article__title',
-                    'content': '.zn-body__paragraph, .el-editorial-source p, p[data-zn-id="paragraph"], .l-container p, .pg-body p, .BasicArticle__main p, .Article__content p, div[data-zn-id="paragraph"], .wysiwyg p, article p, .body-text p',
-                    'date': '.timestamp, time, .metadata__date, [data-zn-id="timestamp"]',
-                    'author': '.byline__names, .metadata__byline, .BasicArticle__byline, [data-zn-id="byline"]'
+                    'article_links': [
+                        'a[href*="/2025/"]',
+                        'a[href*="/2024/"]',
+                        'a[data-link-type="article"]',
+                        '.container__link',
+                        'h3 a',
+                        '.cd__headline-text a',
+                        '.card a',
+                        '.headline a',
+                        'article a',
+                        '.zone a[href*="/20"]',
+                        'a[data-zjs*="headline"]',
+                        '.cd__content a',
+                        '.layout__wrapper a',
+                        '.card-media a',
+                        '.story a',
+                        'a[href*="/index.html"]',
+                        'a[href*="cnn.com"]'
+                    ],
+                    'title': [
+                        'h1[data-editable="headlineText"]',
+                        'h1',
+                        '.headline__text',
+                        '.pg-headline',
+                        '[data-zn-id="headline"]',
+                        '.Article__title'
+                    ],
+                    'content': [
+                        '.zn-body__paragraph',
+                        'p[data-zn-id="paragraph"]',
+                        '.l-container p',
+                        '.pg-body p',
+                        '.BasicArticle__main p',
+                        '.Article__content p',
+                        'div[data-zn-id="paragraph"]',
+                        '.wysiwyg p',
+                        'article p',
+                        '.body-text p'
+                    ],
+                    'date': [
+                        '.timestamp',
+                        'time',
+                        '.metadata__date',
+                        '[data-zn-id="timestamp"]'
+                    ],
+                    'author': [
+                        '.byline__names',
+                        '.metadata__byline',
+                        '.BasicArticle__byline',
+                        '[data-zn-id="byline"]'
+                    ]
+                }
+            },
+            'reuters': {
+                'base_urls': [
+                    'https://www.reuters.com/world/',
+                    'https://www.reuters.com/business/',
+                    'https://www.reuters.com/technology/',
+                    'https://www.reuters.com/markets/',
+                    'https://www.reuters.com/legal/',
+                    'https://www.reuters.com/breakingviews/',
+                    'https://www.reuters.com/business/finance/',
+                    'https://www.reuters.com/business/energy/',
+                    'https://www.reuters.com/world/americas/',
+                    'https://www.reuters.com/world/europe/',
+                    'https://www.reuters.com/world/asia-pacific/',
+                    'https://www.reuters.com/world/middle-east/',
+                    'https://www.reuters.com/world/africa/',
+                    'https://www.reuters.com',
+                    'https://www.reuters.com/news/archive'
+                ],
+                'selectors': {
+                    'article_links': [
+                        'a[data-testid="Heading"]',
+                        'a[data-testid="Body"]',
+                        'a[href*="/world/"]',
+                        'a[href*="/business/"]',
+                        'a[href*="/technology/"]',
+                        'a[href*="/markets/"]',
+                        'a[href*="/legal/"]',
+                        'a[href*="/breakingviews/"]',
+                        'h3 a',
+                        'h2 a',
+                        '.story-title a',
+                        '.media-story-card__headline a',
+                        '.story-card a',
+                        'article a',
+                        'a[href*="/news/"]',
+                        'a[data-module="ArticleLink"]',
+                        '.text__text a',
+                        'a[href*="reuters.com/"]',
+                        'a[data-testid*="Link"]',
+                        '.story a',
+                        '.headline a',
+                        '.card a',
+                        'a[href*="/2025/"]',
+                        'a[href*="/2024/"]',
+                        '.article-card a',
+                        '.content a',
+                        '[data-testid*="story-card"] a',
+                        '.story-collection a',
+                        '.item a',
+                        '.news-headline a',
+                        '.topic-container a',
+                        '[data-testid="Card"] a'
+                    ],
+                    'title': [
+                        'h1[data-testid="Heading"]',
+                        'h1[data-testid="ArticleHeader:headline"]',
+                        'h1',
+                        '.ArticleHeader_headline',
+                        '.headline',
+                        '.title',
+                        'header h1',
+                        '[data-testid*="headline"]'
+                    ],
+                    'content': [
+                        '[data-testid="paragraph-0"]',
+                        '[data-testid="paragraph-1"]',
+                        '[data-testid="paragraph-2"]',
+                        '[data-testid="paragraph-3"]',
+                        '[data-testid="paragraph-4"]',
+                        'p[data-testid*="paragraph"]',
+                        '.ArticleBody_container p',
+                        'article p',
+                        '.content p',
+                        '.body p',
+                        '.text p',
+                        '[data-testid="ArticleBody"] p',
+                        '.story-body p',
+                        '.article-content p'
+                    ],
+                    'date': [
+                        'time[datetime]',
+                        '[data-testid="ArticleHeader:dateTime"]',
+                        '.ArticleHeader_date',
+                        '.timestamp',
+                        '.date',
+                        'time'
+                    ],
+                    'author': [
+                        '[data-testid="AuthorByline"]',
+                        '.ArticleHeader_author',
+                        '.byline',
+                        '.author',
+                        '[data-testid*="author"]'
+                    ]
                 }
             }
         }
     
-    def create_multiple_sessions(self):
+    def init_drivers(self, num_drivers=2):
+        if not hasattr(self, 'logger'):
+            logging.basicConfig(level=logging.INFO)
+            self.logger = logging.getLogger(__name__)
+        
         user_agents = [
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:122.0) Gecko/20100101 Firefox/122.0'
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
         ]
         
-        sessions = []
-        for i, ua in enumerate(user_agents):
-            session = requests.Session()
-            session.headers.update({
-                'User-Agent': ua,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1',
-                'Cache-Control': 'max-age=0',
-                'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-                'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"' if i % 2 == 0 else '"macOS"'
-            })
-            
-            # Add some randomization to make requests look more human
-            session.cookies.set('session_id', f'sess_{i}_{random.randint(1000, 9999)}')
-            sessions.append(session)
+        print(f"🔄 Initializing Selenium drivers for parallel processing...")
+        print(f"🎯 Target: {num_drivers} drivers for {num_drivers} max workers")
         
-        return sessions
-    
-    def get_session(self):
-        session = self.sessions[self.current_session_index]
-        self.current_session_index = (self.current_session_index + 1) % len(self.sessions)
-        return session
-    
-    def init_database(self):
-        self.conn = sqlite3.connect('enhanced_news_articles.db')
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS articles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                content TEXT,
-                url TEXT UNIQUE,
-                source TEXT,
-                published_date TEXT,
-                author TEXT,
-                category TEXT,
-                scraping_method TEXT,
-                sentiment_score REAL,
-                sentiment_label TEXT,
-                keywords TEXT,
-                scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        self.conn.commit()
-    
-    def get_page_content_requests(self, url: str, source: str = None, retries: int = 3) -> BeautifulSoup:
-        for attempt in range(retries):
+        for i in range(num_drivers):
             try:
-                session = self.get_session()
-                time.sleep(random.uniform(2, 5))
+                options = Options()
+                if self.headless:
+                    options.add_argument('--headless=new')
                 
-                response = session.get(url, timeout=25, allow_redirects=True)
-                response.raise_for_status()
+                options.add_argument('--no-sandbox')
+                options.add_argument('--disable-dev-shm-usage')
+                options.add_argument('--disable-gpu')
+                options.add_argument('--disable-images')
+                options.add_argument('--disable-plugins')
+                options.add_argument('--disable-extensions')
+                options.add_argument('--disable-background-timer-throttling')
+                options.add_argument('--disable-backgrounding-occluded-windows')
+                options.add_argument('--disable-renderer-backgrounding')
+                options.add_argument('--window-size=1920,1080')
+                options.add_argument(f'--user-agent={random.choice(user_agents)}')
                 
-                if len(response.text) < 500:
-                    if attempt < retries - 1:
-                        continue
-                    else:
-                        raise NewsScrapingError(f"Insufficient content from {url}")
+                options.add_experimental_option("excludeSwitches", ["enable-automation"])
+                options.add_experimental_option('useAutomationExtension', False)
                 
-                return BeautifulSoup(response.content, 'html.parser')
+                prefs = {
+                    "profile.managed_default_content_settings.images": 2,
+                    "profile.default_content_setting_values.notifications": 2,
+                    "profile.managed_default_content_settings.media_stream": 2,
+                }
+                options.add_experimental_option("prefs", prefs)
                 
-            except requests.exceptions.RequestException as e:
-                if attempt < retries - 1:
-                    time.sleep((attempt + 1) * 3)
-                    continue
+                if WEBDRIVER_MANAGER_AVAILABLE:
+                    service = Service(ChromeDriverManager().install())
+                    driver = webdriver.Chrome(service=service, options=options)
                 else:
-                    raise NewsScrapingError(f"Failed to fetch {url}: {str(e)}")
-    
-    def extract_article_links(self, soup: BeautifulSoup, source_config: Dict, source: str) -> List[str]:
-        links = []
-        selector = source_config['selectors']['article_links']
-        
-        selectors_to_try = selector.split(', ')
-        
-        for sel in selectors_to_try:
-            link_elements = soup.select(sel.strip())
-            if link_elements:
-                break
-        
-        for link_elem in link_elements:
-            href = link_elem.get('href')
-            if href:
-                if href.startswith('/'):
-                    if source == 'ap':
-                        full_url = f"https://apnews.com{href}"
-                    elif source == 'cnn':
-                        full_url = f"https://edition.cnn.com{href}"
-                    else:
-                        full_url = urljoin(source_config['base_url'], href)
-                else:
-                    full_url = href
+                    driver = webdriver.Chrome(options=options)
                 
-                if self.is_valid_article_url(full_url, source):
-                    links.append(full_url)
-        
-        unique_links = list(set(links))[:self.max_articles_per_source]
-        self.logger.info(f"Found {len(unique_links)} valid article links for {source}")
-        
-        return unique_links
-    
-    def is_valid_article_url(self, url: str, source: str) -> bool:
-        invalid_patterns = [
-            '/video/', '/gallery/', '/live/', '/sport/', '/sports/',
-            '/opinion/', '/weather/', '/entertainment/', '/podcasts/',
-            'javascript:', 'mailto:', '/newsletter', '/subscribe'
-        ]
-        
-        url_lower = url.lower()
-        return not any(pattern in url_lower for pattern in invalid_patterns)
-    
-    def extract_article_content(self, url: str, source: str, method: str = "requests") -> Optional[NewsArticle]:
-        try:
-            if method == "selenium" and self.selenium_manager:
-                soup = self.selenium_manager.get_page_selenium(url)
-            else:
-                soup = self.get_page_content_requests(url, source)
-            
-            if method == "selenium":
-                config = self.selenium_sources.get(source, {}).get('selectors', {})
-            else:
-                config = self.requests_sources.get(source, {}).get('selectors', {})
-            
-            if not config:
-                self.logger.warning(f"No config found for {source} with method {method}")
-                return None
-            
-            title = "No title"
-            if 'title' in config:
-                title_selectors = config['title'].split(', ')
-                for title_selector in title_selectors:
-                    title_elem = soup.select_one(title_selector.strip())
-                    if title_elem and title_elem.get_text().strip():
-                        title = title_elem.get_text().strip()
-                        break
-            
-            content_parts = []
-            if 'content' in config:
-                content_selectors = config['content'].split(', ')
-                for content_selector in content_selectors:
-                    content_elems = soup.select(content_selector.strip())
-                    if content_elems:
-                        content_parts.extend([elem.get_text().strip() for elem in content_elems if elem.get_text().strip()])
-                        if content_parts:
-                            break
-            
-            content = ' '.join(content_parts)
-            
-            published_date = str(datetime.now().date())
-            if 'date' in config:
-                date_selectors = config['date'].split(', ')
-                for date_selector in date_selectors:
-                    date_elem = soup.select_one(date_selector.strip())
-                    if date_elem:
-                        date_value = date_elem.get('datetime') or date_elem.get('content') or date_elem.get_text().strip()
-                        if date_value:
-                            published_date = date_value[:10] if len(date_value) > 10 else date_value
-                            break
-            
-            author = "Unknown"
-            if 'author' in config:
-                author_selectors = config['author'].split(', ')
-                for author_selector in author_selectors:
-                    author_elem = soup.select_one(author_selector.strip())
-                    if author_elem and author_elem.get_text().strip():
-                        author = author_elem.get_text().strip()[:100]
-                        break
-            
-            if len(content) < 50:
-                self.logger.warning(f"Skipping article with insufficient content: {url}")
-                return None
-            
-            article = NewsArticle(
-                title=title[:500],
-                content=content[:5000],
-                url=url,
-                source=source,
-                published_date=published_date,
-                author=author,
-                category=self.determine_category(url),
-                scraping_method=method
-            )
-            
-            self.analyze_sentiment(article)
-            
-            return article
-            
-        except Exception as e:
-            self.logger.error(f"Error extracting article from {url} using {method}: {str(e)}")
-            return None
-    
-    def determine_category(self, url: str) -> str:
-        categories = {
-            'business': ['business', 'economy', 'finance', 'markets', 'money'],
-            'technology': ['technology', 'tech', 'science', 'digital'],
-            'world': ['world', 'international', 'global'],
-            'politics': ['politics', 'government', 'election'],
-            'health': ['health', 'medical', 'coronavirus', 'covid']
-        }
-        
-        url_lower = url.lower()
-        for category, keywords in categories.items():
-            if any(keyword in url_lower for keyword in keywords):
-                return category
-        return 'general'
-    
-    def analyze_sentiment(self, article: NewsArticle):
-        text = f"{article.title} {article.content}"
-        scores = self.sia.polarity_scores(text)
-        
-        article.sentiment_score = scores['compound']
-        
-        if scores['compound'] >= 0.05:
-            article.sentiment_label = 'positive'
-        elif scores['compound'] <= -0.05:
-            article.sentiment_label = 'negative'
-        else:
-            article.sentiment_label = 'neutral'
-        
-        article.keywords = self.extract_keywords(text)
-    
-    def extract_keywords(self, text: str, top_n: int = 10) -> List[str]:
-        try:
-            if NLTK_AVAILABLE:
-                words = word_tokenize(text.lower())
-                stop_words = set(stopwords.words('english'))
+                driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                driver.set_page_load_timeout(20)
+                driver.implicitly_wait(3)
                 
-                keywords = []
-                for word in words:
-                    if (word.isalpha() and 
-                        len(word) > 3 and 
-                        word not in stop_words):
-                        keywords.append(self.lemmatizer.lemmatize(word))
-                
-                counter = Counter(keywords)
-                return [word for word, count in counter.most_common(top_n)]
-            else:
-                words = text.lower().split()
-                common_words = {'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
-                keywords = [word for word in words if len(word) > 3 and word not in common_words and word.isalpha()]
-                counter = Counter(keywords)
-                return [word for word, count in counter.most_common(top_n)]
-        except:
-            return []
-    
-    def save_article(self, article: NewsArticle):
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                INSERT OR IGNORE INTO articles 
-                (title, content, url, source, published_date, author, category, 
-                 scraping_method, sentiment_score, sentiment_label, keywords)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                article.title, article.content, article.url, article.source,
-                article.published_date, article.author, article.category,
-                article.scraping_method, article.sentiment_score, article.sentiment_label,
-                json.dumps(article.keywords)
-            ))
-            self.conn.commit()
-        except Exception as e:
-            self.logger.error(f"Error saving article to database: {str(e)}")
-    
-    def scrape_source_selenium(self, source: str) -> List[NewsArticle]:
-        self.logger.info(f"Starting Selenium scraping for {source}")
-        articles = []
-        
-        if not self.selenium_manager:
-            self.logger.error(f"Selenium not available for {source}")
-            return articles
-        
-        try:
-            config = self.selenium_sources[source]
-            
-            for section in config['sections']:
-                self.logger.info(f"Selenium scraping {source} - {section}")
-                
-                if 'section_urls' in config and section in config['section_urls']:
-                    section_url = config['section_urls'][section]
-                else:
-                    section_url = f"{config['base_url']}/{section}"
-                
-                try:
-                    soup = self.selenium_manager.get_page_selenium(section_url)
-                    article_links = self.extract_article_links(soup, config, source)
-                    
-                    if not article_links:
-                        self.logger.warning(f"No article links found for {source} - {section}")
-                        continue
-                    
-                    self.logger.info(f"Found {len(article_links)} article links in {section}")
-                    
-                    for i, link in enumerate(article_links[:15]):
-                        try:
-                            time.sleep(random.uniform(3, 6))
-                            
-                            article = self.extract_article_content(link, source, method="selenium")
-                            if article and len(article.content) > 50:
-                                articles.append(article)
-                                self.save_article(article)
-                                self.logger.info(f"Selenium {source}: {article.title[:50]}...")
-                                
-                        except Exception as e:
-                            self.logger.error(f"Selenium error scraping {link}: {str(e)}")
-                            continue
-                        
-                except Exception as e:
-                    self.logger.error(f"Selenium error in section {section}: {str(e)}")
-                    continue
-                
-                time.sleep(random.uniform(4, 7))
-                
-        except Exception as e:
-            self.logger.error(f"Selenium error scraping source {source}: {str(e)}")
-        
-        self.logger.info(f"Selenium completed {source}: {len(articles)} articles scraped")
-        return articles
-    
-    def scrape_source_requests(self, source: str) -> List[NewsArticle]:
-        self.logger.info(f"Starting Requests scraping for {source}")
-        articles = []
-        
-        try:
-            config = self.requests_sources[source]
-            
-            for section in config['sections']:
-                self.logger.info(f"Requests scraping {source} - {section}")
-                
-                # Use section_urls if available, otherwise construct from base_url
-                if 'section_urls' in config and section in config['section_urls']:
-                    section_url = config['section_urls'][section]
-                else:
-                    section_url = f"{config['base_url']}/{section}"
-                
-                try:
-                    soup = self.get_page_content_requests(section_url, source)
-                    article_links = self.extract_article_links(soup, config, source)
-                    
-                    if not article_links:
-                        self.logger.warning(f"No article links found for {source} - {section}")
-                        continue
-                    
-                    self.logger.info(f"Found {len(article_links)} article links in {section}")
-                    
-                    for i, link in enumerate(article_links[:15]):
-                        try:
-                            time.sleep(random.uniform(2, 4))
-                            
-                            article = self.extract_article_content(link, source, method="requests")
-                            if article and len(article.content) > 50:
-                                articles.append(article)
-                                self.save_article(article)
-                                self.logger.info(f"Requests {source}: {article.title[:50]}...")
-                                
-                        except Exception as e:
-                            self.logger.error(f"Requests error scraping {link}: {str(e)}")
-                            continue
-                        
-                except Exception as e:
-                    self.logger.error(f"Requests error in section {section}: {str(e)}")
-                    continue
-                
-                time.sleep(random.uniform(3, 5))
-                
-        except Exception as e:
-            self.logger.error(f"Requests error scraping source {source}: {str(e)}")
-        
-        self.logger.info(f"Requests completed {source}: {len(articles)} articles scraped")
-        return articles
-    
-    def scrape_all_sources(self) -> List[NewsArticle]:
-        all_articles = []
-        
-        # Try all sources with requests method first (more reliable)
-        requests_count = 0
-        for source in self.requests_sources.keys():
-            try:
-                time.sleep(random.uniform(5, 8))
-                articles = self.scrape_source_requests(source)
-                all_articles.extend(articles)
-                requests_count += len(articles)
+                self.drivers.append(driver)
+                print(f"✅ Driver {i+1} initialized successfully")
                 
             except Exception as e:
-                self.logger.error(f"Critical Requests error for {source}: {str(e)}")
-                continue
+                self.logger.error(f"Failed to initialize driver {i+1}: {str(e)}")
+                print(f"❌ Driver {i+1} failed: {str(e)}")
         
-        # Only try selenium for sources that failed with requests
-        selenium_count = 0
-        failed_sources = []
-        for source in self.selenium_sources.keys():
-            source_articles = [a for a in all_articles if a.source == source]
-            if len(source_articles) == 0:  # No articles found with requests
-                failed_sources.append(source)
+        if not self.drivers:
+            raise Exception("Failed to initialize any drivers")
         
-        if failed_sources and self.selenium_manager:
-            self.logger.info(f"Attempting Selenium fallback for sources: {', '.join(failed_sources)}")
-            for source in failed_sources:
-                try:
-                    time.sleep(random.uniform(8, 12))
-                    articles = self.scrape_source_selenium(source)
-                    all_articles.extend(articles)
-                    selenium_count += len(articles)
+        self.logger.info(f"Initialized {len(self.drivers)} Selenium drivers for parallel processing")
+        print(f"🎉 Successfully initialized {len(self.drivers)} drivers for parallel processing")
+        print(f"🚀 Parallel processing ready with {len(self.drivers)} concurrent workers!")
+    
+    def get_driver(self):
+        with self.driver_lock:
+            driver = self.drivers[self.current_driver_index]
+            self.current_driver_index = (self.current_driver_index + 1) % len(self.drivers)
+            return driver
+    
+    def init_database(self):
+        try:
+            self.conn = sqlite3.connect('selenium_news_articles.db', check_same_thread=False)
+            self.cursor = self.conn.cursor()
+            
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS articles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    url TEXT UNIQUE NOT NULL,
+                    source TEXT NOT NULL,
+                    published_date TEXT,
+                    author TEXT,
+                    category TEXT,
+                    sentiment_score REAL,
+                    sentiment_label TEXT,
+                    scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    content_length INTEGER,
+                    word_count INTEGER
+                )
+            ''')
+            
+            self.cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_source ON articles(source)
+            ''')
+            self.cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_sentiment ON articles(sentiment_label)
+            ''')
+            self.cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_date ON articles(published_date)
+            ''')
+            
+            self.conn.commit()
+            self.logger.info("Database initialized successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Database initialization failed: {str(e)}")
+            raise
+    
+    def categorize_article(self, title, content):
+        text = (title + " " + content).lower()
+        
+        categories = {
+            'business': ['business', 'economy', 'market', 'stock', 'finance', 'trade', 'company', 'corporate', 'investment', 'bank'],
+            'technology': ['technology', 'tech', 'ai', 'artificial intelligence', 'software', 'computer', 'digital', 'cyber', 'innovation', 'startup'],
+            'politics': ['politics', 'government', 'election', 'vote', 'congress', 'senate', 'president', 'policy', 'law', 'parliament'],
+            'health': ['health', 'medical', 'medicine', 'doctor', 'hospital', 'disease', 'virus', 'vaccine', 'treatment', 'healthcare'],
+            'world': ['international', 'global', 'world', 'country', 'nation', 'war', 'conflict', 'diplomatic', 'foreign', 'crisis'],
+            'sports': ['sport', 'game', 'team', 'player', 'match', 'championship', 'league', 'tournament', 'olympic', 'football']
+        }
+        
+        category_scores = {}
+        for category, keywords in categories.items():
+            score = sum(1 for keyword in keywords if keyword in text)
+            if score > 0:
+                category_scores[category] = score
+        
+        if category_scores:
+            return max(category_scores.items(), key=lambda x: x[1])[0]
+        return 'general'
+    
+    def analyze_sentiment(self, text):
+        try:
+            if hasattr(self.sia, 'polarity_scores'):
+                scores = self.sia.polarity_scores(text)
+                compound = scores['compound']
                 
-                except Exception as e:
-                    self.logger.error(f"Critical Selenium fallback error for {source}: {str(e)}")
-                    continue
+                if compound >= 0.05:
+                    return compound, 'positive'
+                elif compound <= -0.05:
+                    return compound, 'negative'
+                else:
+                    return compound, 'neutral'
+            else:
+                return 0.0, 'neutral'
+                
+        except Exception as e:
+            self.logger.error(f"Sentiment analysis error: {str(e)}")
+            return 0.0, 'neutral'
+    
+    def fast_wait_and_scroll(self, driver, url, max_wait=3):
+        try:
+            WebDriverWait(driver, max_wait).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight/3);")
+            time.sleep(0.3)
+            
+        except TimeoutException:
+            self.logger.debug(f"Timeout waiting for page load: {url}")
+        except Exception as e:
+            self.logger.debug(f"Scroll error for {url}: {str(e)}")
+    
+    def is_valid_article_url(self, url, source):
+        if not url or '#' in url or 'javascript:' in url or 'mailto:' in url:
+            return False
         
-        self.print_scraping_summary(all_articles)
+        invalid_patterns = [
+            '/video/', '/live/', '/weather/', '/sport/', '/iplayer/', '/sounds/',
+            '/programmes/', '/schedule/', '/contact/', '/about/', '/help/',
+            '/terms/', '/privacy/', '/cookies/', '/accessibility/', '/newsletter',
+            '/register', '/sign-in', '/login', '/profile', '/account', '/subscribe',
+            '/gallery/', '/photos/', '/pictures/', '/images/', '/podcast/',
+            '/radio/', '/tv/', '/media/', '/multimedia/', '/interactive/',
+            'share', 'facebook.com', 'twitter.com', 'instagram.com', 'youtube.com',
+            '/tags/', '/topics/', '/authors/', '/search', '/archive/',
+            '/rss', '/feed', '/sitemap', 'mailto:', 'tel:', 'whatsapp:',
+            '/corrections/', '/obituaries/', '/crossword/', '/sudoku/',
+            '/horoscope/', '/games/', '/quiz/', '/competition/',
+            '.pdf', '.jpg', '.png', '.gif', '.mp4', '.mp3',
+            '/live-reporting/', '/coronavirus/', '/covid',
+            '/election/', '/olympics/', '/world-cup/', '/champions-league/'
+        ]
+        
+        url_lower = url.lower()
+        for pattern in invalid_patterns:
+            if pattern in url_lower:
+                return False
+        
+        today = datetime.now()
+        yesterday = today - timedelta(days=1)
+        
+        date_patterns = [
+            today.strftime("/%Y/%m/%d/"),
+            yesterday.strftime("/%Y/%m/%d/"),
+            today.strftime("/%Y-%m-%d"),
+            yesterday.strftime("/%Y-%m-%d"),
+            '/2025/', '/2024/'
+        ]
+        
+        for pattern in date_patterns:
+            if pattern in url:
+                return True
+        
+        return True
+    
+    def optimize_reuters_scraping(self, driver, url):
+        try:
+            WebDriverWait(driver, 3).until(
+                EC.presence_of_element_located((By.TAG_NAME, "article"))
+            )
+            
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+            time.sleep(0.5)
+            
+            overlay_selectors = [
+                '[data-testid="TrustArcOverlay"]',
+                '.trust-arc-overlay',
+                '.cookie-banner',
+                '.overlay',
+                '.modal',
+                '.popup'
+            ]
+            
+            for selector in overlay_selectors:
+                try:
+                    overlay = driver.find_element(By.CSS_SELECTOR, selector)
+                    if overlay.is_displayed():
+                        driver.execute_script("arguments[0].style.display = 'none';", overlay)
+                except:
+                    continue
+                    
+            time.sleep(0.3)
+            
+        except Exception as e:
+            self.logger.debug(f"Reuters optimization failed for {url}: {str(e)}")
+    
+    def extract_text_with_multiple_selectors(self, soup, selectors, source):
+        for selector in selectors:
+            try:
+                elements = soup.select(selector)
+                if elements:
+                    text_parts = []
+                    for elem in elements:
+                        text = elem.get_text(strip=True)
+                        if text and len(text) > 10:
+                            text_parts.append(text)
+                    
+                    if text_parts:
+                        return ' '.join(text_parts)
+                        
+            except Exception as e:
+                self.logger.debug(f"Selector {selector} failed for {source}: {str(e)}")
+                continue
+                
+        return None
+    
+    def extract_article_content_fast(self, url, source, retries=0):
+        for attempt in range(retries + 1):
+            driver = None
+            try:
+                driver = self.get_driver()
+                
+                time.sleep(random.uniform(0.2, 0.8))
+                driver.get(url)
+                
+                if source == 'reuters':
+                    self.optimize_reuters_scraping(driver, url)
+                else:
+                    self.fast_wait_and_scroll(driver, url)
+                    
+                soup = BeautifulSoup(driver.page_source, 'html.parser')
+                config = self.news_sources[source]['selectors']
+                
+                title = "No title"
+                for selector in config['title'][:3]:
+                    try:
+                        title_elem = soup.select_one(selector)
+                        if title_elem and title_elem.get_text(strip=True):
+                            title = title_elem.get_text(strip=True)
+                            break
+                    except:
+                        continue
+                
+                content_parts = []
+                for selector in config['content'][:4]:
+                    try:
+                        elements = soup.select(selector)
+                        for elem in elements[:10]:
+                            text = elem.get_text(strip=True)
+                            if text and len(text) > 20:
+                                content_parts.append(text)
+                        
+                        if len(content_parts) >= 3:
+                            break
+                    except:
+                        continue
+                
+                content = ' '.join(content_parts) if content_parts else "No content"
+                
+                if len(content) < 100:
+                    content = self.extract_text_with_multiple_selectors(soup, config['content'], source) or content
+                
+                author = "Unknown"
+                for selector in config['author'][:2]:
+                    try:
+                        author_elem = soup.select_one(selector)
+                        if author_elem and author_elem.get_text(strip=True):
+                            author = author_elem.get_text(strip=True)
+                            break
+                    except:
+                        continue
+                
+                published_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                for selector in config['date'][:2]:
+                    try:
+                        date_elem = soup.select_one(selector)
+                        if date_elem:
+                            date_text = date_elem.get('datetime') or date_elem.get_text(strip=True)
+                            if date_text:
+                                published_date = date_text
+                                break
+                    except:
+                        continue
+                
+                return {
+                    'title': title,
+                    'content': content,
+                    'url': url,
+                    'source': source,
+                    'published_date': published_date,
+                    'author': author
+                }
+                
+            except Exception as e:
+                self.logger.debug(f"Attempt {attempt + 1} failed for {url}: {str(e)}")
+                if attempt < retries:
+                    time.sleep(random.uniform(1, 3))
+                continue
+            
+        return None
+    
+    def extract_article_links_fast(self, url, source):
+        driver = None
+        try:
+            driver = self.get_driver()
+            time.sleep(random.uniform(0.5, 1.5))
+            
+            driver.get(url)
+            self.fast_wait_and_scroll(driver, url)
+            
+            soup = BeautifulSoup(driver.page_source, 'html.parser')
+            
+            links = set()
+            config = self.news_sources[source]['selectors']
+            
+            for selector in config['article_links']:
+                try:
+                    elements = soup.select(selector)
+                    for element in elements:
+                        href = element.get('href')
+                        if href and self.is_valid_article_url(href, source):
+                            if href.startswith('/'):
+                                base_domains = {
+                                    'ap': 'https://apnews.com',
+                                    'cnn': 'https://edition.cnn.com', 
+                                    'bbc': 'https://www.bbc.com',
+                                    'guardian': 'https://www.theguardian.com',
+                                    'reuters': 'https://www.reuters.com'
+                                }
+                                href = base_domains.get(source, 'https://') + href
+                            links.add(href)
+                except:
+                    continue
+            
+            if len(links) < 5:
+                print("🔄 Trying fallback selectors...")
+                fallback_selectors = [
+                    'a[href*="2025"]',
+                    'a[href*="2024"]',  
+                    'article a',
+                    '.article a',
+                    'h3 a',
+                    'h2 a',
+                    'h1 a',
+                    '.headline a',
+                    '.title a',
+                    '.story a',
+                    '.card a',
+                    '.link a',
+                    'a[href*="/news/"]',
+                    'a[href*="/article/"]',
+                    'a[href*="/story/"]'
+                ]
+                
+                for selector in fallback_selectors:
+                    try:
+                        elements = soup.select(selector)
+                        for element in elements[:20]:
+                            href = element.get('href')
+                            if href and self.is_valid_article_url(href, source):
+                                if href.startswith('/'):
+                                    base_domains = {
+                                        'ap': 'https://apnews.com',
+                                        'cnn': 'https://edition.cnn.com', 
+                                        'bbc': 'https://www.bbc.com',
+                                        'guardian': 'https://www.theguardian.com',
+                                        'reuters': 'https://www.reuters.com'
+                                    }
+                                    href = base_domains.get(source, 'https://') + href
+                                links.add(href)
+                        
+                        if len(links) >= 10:
+                            break
+                    except:
+                        continue
+            
+            unique_links = list(links)[:self.max_articles_per_source]
+            self.logger.info(f"Extracted {len(unique_links)} article links for {source}")
+            print(f"🎯 Total valid links found: {len(unique_links)}")
+            
+            return unique_links
+            
+        except Exception as e:
+            self.logger.error(f"Failed to extract links from {url}: {str(e)}")
+            return []
+        
+    def scrape_source_fast(self, source):
+        print(f"\n🚀 TURBO MODE: Starting {source.upper()} with parallel link extraction")
+        start_time = time.time()
+        all_articles = []
+        
+        config = self.news_sources[source]
+        print(f"📍 {source.upper()}: {len(config['base_urls'])} URLs to process")
+        
+        all_links = []
+        
+        with ThreadPoolExecutor(max_workers=min(3, len(self.drivers))) as executor:
+            future_to_url = {
+                executor.submit(self.extract_article_links_fast, url, source): url 
+                for url in config['base_urls']
+            }
+            
+            for future in as_completed(future_to_url):
+                url = future_to_url[future]
+                try:
+                    links = future.result(timeout=30)
+                    all_links.extend(links)
+                    print(f"✅ {url}: {len(links)} links")
+                except Exception as e:
+                    print(f"❌ {url}: Failed - {str(e)[:50]}")
+        
+        unique_links = list(set(all_links))[:self.max_articles_per_source]
+        print(f"🎯 {source.upper()}: Processing {len(unique_links)} unique articles")
+        
+        if not unique_links:
+            print(f"⚠️  No valid links found for {source}")
+            return []
+        
+        with ThreadPoolExecutor(max_workers=min(len(self.drivers), 6)) as executor:
+            future_to_url = {
+                executor.submit(self.extract_article_content_fast, link, source, 1): link 
+                for link in unique_links
+            }
+            
+            for future in as_completed(future_to_url):
+                url = future_to_url[future]
+                try:
+                    article_data = future.result(timeout=15)
+                    if article_data and len(article_data.get('content', '')) > 100:
+                        category = self.categorize_article(article_data['title'], article_data['content'])
+                        sentiment_score, sentiment_label = self.analyze_sentiment(
+                            article_data['title'] + " " + article_data['content']
+                        )
+                        
+                        article_data.update({
+                            'category': category,
+                            'sentiment_score': sentiment_score,
+                            'sentiment_label': sentiment_label
+                        })
+                        
+                        all_articles.append(article_data)
+                        
+                        if len(all_articles) % 10 == 0:
+                            print(f"📊 {source.upper()}: {len(all_articles)} articles processed")
+                    
+                except Exception as e:
+                    self.logger.debug(f"Failed to process {url}: {str(e)}")
+        
+        elapsed = time.time() - start_time
+        articles_per_min = (len(all_articles) / elapsed) * 60 if elapsed > 0 else 0
+        
+        print(f"🎉 {source.upper()}: {len(all_articles)} articles in {elapsed:.1f}s ({articles_per_min:.1f}/min)")
         return all_articles
     
-    def print_scraping_summary(self, articles: List[NewsArticle]):
-        if not articles:
-            print("No articles were successfully scraped.")
-            return
+    def scrape_all_sources_fast(self):
+        print("🚀 Starting TURBO NEWS SCRAPING with PARALLEL SOURCE processing")
+        start_time = time.time()
+        all_articles = []
+        
+        USE_PARALLEL_SOURCES = False
+        
+        if USE_PARALLEL_SOURCES and len(self.drivers) >= len(self.news_sources):
+            print("🔥 EXPERIMENTAL: Processing all sources in parallel!")
             
-        source_counts = {}
-        category_counts = {}
-        method_counts = {'selenium': 0, 'requests': 0}
+            with ThreadPoolExecutor(max_workers=min(len(self.news_sources), len(self.drivers))) as executor:
+                future_to_source = {
+                    executor.submit(self.scrape_source_fast, source): source 
+                    for source in self.news_sources.keys()
+                }
+                
+                for future in as_completed(future_to_source):
+                    source = future_to_source[future]
+                    try:
+                        articles = future.result(timeout=180)
+                        all_articles.extend(articles)
+                        print(f"🎯 {source.upper()} completed: {len(articles)} articles")
+                    except Exception as e:
+                        print(f"❌ {source.upper()} failed: {str(e)[:100]}")
+                        self.logger.error(f"Failed to scrape source {source}: {str(e)}")
+        else:
+            for source in self.news_sources.keys():
+                try:
+                    print(f"\n{'='*50}")
+                    print(f"📰 PROCESSING: {source.upper()}")
+                    print(f"{'='*50}")
+                    
+                    articles = self.scrape_source_fast(source)
+                    if articles:
+                        all_articles.extend(articles)
+                        print(f"✅ {source.upper()}: Successfully collected {len(articles)} articles")
+                    else:
+                        print(f"❌ {source.upper()}: No articles collected")
+                        
+                except Exception as e:
+                    print(f"❌ {source.upper()} failed: {str(e)}")
+                    self.logger.error(f"Failed to scrape source {source}: {str(e)}")
         
+        if all_articles:
+            self.save_articles_to_database(all_articles)
+        
+        total_time = time.time() - start_time
+        self.display_performance_metrics(all_articles, total_time)
+        
+        return all_articles
+    
+    def save_articles_to_database(self, articles):
+        try:
+            for article in articles:
+                content_length = len(article.get('content', ''))
+                word_count = len(article.get('content', '').split())
+                
+                self.cursor.execute('''
+                    INSERT OR REPLACE INTO articles 
+                    (title, content, url, source, published_date, author, category, 
+                     sentiment_score, sentiment_label, content_length, word_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    article['title'],
+                    article['content'],
+                    article['url'],
+                    article['source'],
+                    article['published_date'],
+                    article['author'],
+                    article['category'],
+                    article['sentiment_score'],
+                    article['sentiment_label'],
+                    content_length,
+                    word_count
+                ))
+            
+            self.conn.commit()
+            self.logger.info(f"Saved {len(articles)} articles to database")
+            
+        except Exception as e:
+            self.logger.error(f"Database save error: {str(e)}")
+    
+    def display_performance_metrics(self, articles, total_time):
+        if not articles:
+            print("❌ No articles collected")
+            return
+        
+        print(f"\n{'='*60}")
+        print(f"🎉 SELENIUM NEWS SCRAPING COMPLETED!")
+        print(f"{'='*60}")
+        
+        articles_per_second = len(articles) / total_time if total_time > 0 else 0
+        articles_per_minute = articles_per_second * 60
+        avg_content_length = sum(len(article.get('content', '')) for article in articles) / len(articles)
+        
+        print(f"PERFORMANCE METRICS:")
+        print(f"Total time: {total_time:.1f} seconds")
+        print(f"Articles per second: {articles_per_second:.2f}")
+        print(f"Total articles: {len(articles)}")
+        print(f"Average content length: {avg_content_length:.0f} characters")
+        print(f"Parallel efficiency: {articles_per_minute:.1f} articles/minute")
+        
+        source_stats = {}
         for article in articles:
-            source_counts[article.source] = source_counts.get(article.source, 0) + 1
-            category_counts[article.category] = category_counts.get(article.category, 0) + 1
-            method_counts[article.scraping_method] = method_counts.get(article.scraping_method, 0)
+            source = article['source']
+            source_stats[source] = source_stats.get(source, 0) + 1
         
-        print("SCRAPING SUMMARY")
+        print(f"\n📊 SOURCE BREAKDOWN:")
+        for source, count in sorted(source_stats.items(), key=lambda x: x[1], reverse=True):
+            percentage = (count / len(articles)) * 100
+            rate_per_min = (count / total_time) * 60 if total_time > 0 else 0
+            
+            if rate_per_min >= 2.0:
+                status = "🚀 FAST"
+            elif rate_per_min >= 1.0:
+                status = "✅ OK"
+            else:
+                status = "🐌 SLOW"
+            
+            print(f"   {source.upper():10} | {count:3d} articles ({percentage:5.1f}%) | {rate_per_min:.1f}/min | {status}")
         
-        print("SELENIUM SOURCES:")
-        for source in self.selenium_sources.keys():
-            count = source_counts.get(source, 0)
-            status = "SUCCESS" if count > 0 else "FAILED"
-            print(f"   {source.upper()}: {count} articles | {status}")
+        category_stats = {}
+        for article in articles:
+            category = article.get('category', 'unknown')
+            category_stats[category] = category_stats.get(category, 0) + 1
         
-        print("REQUESTS SOURCES:")
-        for source in self.requests_sources.keys():
-            count = source_counts.get(source, 0)
-            status = "SUCCESS" if count > 0 else "FAILED"
-            print(f"   {source.upper()}: {count} articles | {status}")
+        print(f"\n📈 CATEGORY BREAKDOWN:")
+        for category, count in sorted(category_stats.items(), key=lambda x: x[1], reverse=True):
+            percentage = (count / len(articles)) * 100
+            print(f"   {category.title():12} | {count:3d} articles ({percentage:5.1f}%)")
         
-        print("BY CATEGORY:")
-        for category, count in sorted(category_counts.items()):
-            print(f"   {category.capitalize()}: {count} articles")
+        sentiment_stats = {}
+        for article in articles:
+            sentiment = article.get('sentiment_label', 'neutral')
+            sentiment_stats[sentiment] = sentiment_stats.get(sentiment, 0) + 1
         
-        print("BY METHOD:")
-        print(f"   Selenium: {method_counts['selenium']} articles")
-        print(f"   Requests: {method_counts['requests']} articles")
+        print(f"\n😊 SENTIMENT BREAKDOWN:")
+        sentiment_emojis = {'positive': '😊', 'negative': '😔', 'neutral': '😐'}
+        for sentiment, count in sorted(sentiment_stats.items(), key=lambda x: x[1], reverse=True):
+            percentage = (count / len(articles)) * 100
+            emoji = sentiment_emojis.get(sentiment, '❓')
+            print(f"   {emoji} {sentiment.title():8} | {count:3d} articles ({percentage:5.1f}%)")
         
-        print(f"TOTAL ARTICLES: {len(articles)}")
-        success_sources = len([s for s in source_counts if source_counts[s] > 0])
-        print(f"SUCCESSFUL SOURCES: {success_sources}/4")
+        unique_sources = len(source_stats)
+        total_sources = len(self.news_sources)
+        success_rate = (unique_sources / total_sources) * 100
+        
+        print(f"\n🎯 SUCCESS METRICS:")
+        print(f"Source success rate: {success_rate:.1f}% ({unique_sources}/{total_sources} sources)")
+        
+        if articles_per_minute >= 8:
+            performance = "🚀 EXCELLENT"
+        elif articles_per_minute >= 5:
+            performance = "✅ GOOD"
+        elif articles_per_minute >= 3:
+            performance = "⚠️  MODERATE"
+        else:
+            performance = "🐌 SLOW"
+        
+        print(f"{performance} - {articles_per_minute:.1f} articles/minute")
+        print(f"{'='*60}")
     
-    def __del__(self):
-        if hasattr(self, 'selenium_manager') and self.selenium_manager:
-            self.selenium_manager.close()
+    def cleanup(self):
+        print("🧹 Cleaning up resources...")
+        for i, driver in enumerate(self.drivers):
+            try:
+                driver.quit()
+                print(f"✅ Closed driver {i+1}")
+            except Exception as e:
+                print(f"⚠️  Error closing driver {i+1}: {str(e)}")
+        
         if hasattr(self, 'conn'):
-            self.conn.close()
+            try:
+                self.conn.close()
+                print("✅ Database connection closed")
+            except Exception as e:
+                print(f"⚠️  Error closing database: {str(e)}")
 
-class EnhancedSentimentAnalyzer:
-    
-    def __init__(self, db_path: str = 'enhanced_news_articles.db'):
+
+class SeleniumSentimentAnalyzer:
+    def __init__(self, db_path: str = 'selenium_news_articles.db'):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path)
         
-    def load_articles(self) -> pd.DataFrame:
-        query = '''
-            SELECT * FROM articles 
-            WHERE scraped_at >= datetime('now', '-7 days')
-            ORDER BY scraped_at DESC
-        '''
-        return pd.read_sql_query(query, self.conn)
+        if NLTK_AVAILABLE:
+            self.sia = SentimentIntensityAnalyzer()
+        else:
+            self.sia = SimpleSentimentAnalyzer()
     
-    def method_performance_analysis(self) -> Dict:
-        df = self.load_articles()
+    def get_articles_from_db(self, limit: int = None, source: str = None, 
+                           start_date: str = None, end_date: str = None) -> pd.DataFrame:
+        query = "SELECT * FROM articles WHERE 1=1"
+        params = []
         
-        if len(df) == 0:
+        if source:
+            query += " AND source = ?"
+            params.append(source)
+        
+        if start_date:
+            query += " AND scraped_at >= ?"
+            params.append(start_date)
+        
+        if end_date:
+            query += " AND scraped_at <= ?"
+            params.append(end_date)
+        
+        query += " ORDER BY scraped_at DESC"
+        
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+        
+        return pd.read_sql_query(query, self.conn, params=params)
+    
+    def analyze_sentiment_trends(self, df: pd.DataFrame) -> Dict:
+        if df.empty:
             return {}
         
-        method_analysis = {}
-        for method in df['scraping_method'].unique():
-            method_df = df[df['scraping_method'] == method]
-            if len(method_df) > 0:
-                method_analysis[method] = {
-                    'article_count': len(method_df),
-                    'avg_content_length': method_df['content'].str.len().mean(),
-                    'avg_sentiment': method_df['sentiment_score'].mean(),
-                    'sentiment_std': method_df['sentiment_score'].std(),
-                    'sources': list(method_df['source'].unique()),
-                    'success_rate': len(method_df['source'].unique()) / 2.0
-                }
+        df['scraped_at'] = pd.to_datetime(df['scraped_at'])
+        df['date'] = df['scraped_at'].dt.date
         
-        return method_analysis
-    
-    def sentiment_distribution(self) -> Dict:
-        df = self.load_articles()
-        
-        distribution = {
-            'overall': df['sentiment_label'].value_counts().to_dict(),
-            'by_source': df.groupby('source')['sentiment_label'].value_counts().unstack(fill_value=0).to_dict(),
-            'by_category': df.groupby('category')['sentiment_label'].value_counts().unstack(fill_value=0).to_dict(),
-            'by_method': df.groupby('scraping_method')['sentiment_label'].value_counts().unstack(fill_value=0).to_dict(),
-            'sentiment_scores': {
-                'mean': df['sentiment_score'].mean(),
-                'std': df['sentiment_score'].std(),
-                'selenium_mean': df[df['scraping_method'] == 'selenium']['sentiment_score'].mean() if len(df[df['scraping_method'] == 'selenium']) > 0 else 0,
-                'requests_mean': df[df['scraping_method'] == 'requests']['sentiment_score'].mean() if len(df[df['scraping_method'] == 'requests']) > 0 else 0
+        trends = {
+            'daily_sentiment': df.groupby('date')['sentiment_score'].mean(),
+            'source_sentiment': df.groupby('source')['sentiment_score'].mean(),
+            'category_sentiment': df.groupby('category')['sentiment_score'].mean(),
+            'sentiment_distribution': df['sentiment_label'].value_counts(),
+            'avg_content_length': df['content_length'].mean(),
+            'total_articles': len(df),
+            'date_range': {
+                'start': df['scraped_at'].min(),
+                'end': df['scraped_at'].max()
             }
         }
         
-        return distribution
+        return trends
     
-    def trending_topics(self, top_n: int = 20) -> List[tuple]:
-        df = self.load_articles()
-        all_keywords = []
+    def create_visualizations(self, df: pd.DataFrame, save_path: str = 'selenium_news_dashboard.png'):
+        if df.empty:
+            print("No data available for visualization")
+            return
         
-        for keywords_str in df['keywords'].dropna():
-            try:
-                keywords = json.loads(keywords_str)
-                all_keywords.extend(keywords)
-            except:
-                continue
+        plt.style.use('seaborn-v0_8')
+        fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+        fig.suptitle('📊 News Sentiment Analysis Dashboard', fontsize=16, fontweight='bold')
         
-        counter = Counter(all_keywords)
-        return counter.most_common(top_n)
-    
-    def cross_method_comparison(self) -> Dict:
-        df = self.load_articles()
+        df['scraped_at'] = pd.to_datetime(df['scraped_at'])
         
-        comparison = {}
-        for method in df['scraping_method'].unique():
-            method_df = df[df['scraping_method'] == method]
-            if len(method_df) > 0:
-                comparison[method] = {
-                    'total_articles': len(method_df),
-                    'avg_content_length': method_df['content'].str.len().mean(),
-                    'avg_sentiment': method_df['sentiment_score'].mean(),
-                    'sentiment_consistency': method_df['sentiment_score'].std(),
-                    'category_diversity': len(method_df['category'].unique()),
-                    'source_coverage': len(method_df['source'].unique()),
-                    'success_rate': len(method_df['source'].unique()) / 2.0
-                }
+        sentiment_counts = df['sentiment_label'].value_counts()
+        colors = ['#2ecc71', '#e74c3c', '#95a5a6']
+        axes[0, 0].pie(sentiment_counts.values, labels=sentiment_counts.index, autopct='%1.1f%%', 
+                       colors=colors, startangle=90)
+        axes[0, 0].set_title('😊 Sentiment Distribution')
         
-        return comparison
-
-def create_enhanced_dashboard(df):
-    fig, axes = plt.subplots(4, 3, figsize=(24, 20))
-    fig.suptitle('Mixed Method Global News Sentiment Analysis Dashboard', fontsize=20, fontweight='bold')
-    
-    sentiment_counts = df['sentiment_label'].value_counts()
-    colors = ['#ff6b6b' if x == 'negative' else '#4ecdc4' if x == 'positive' else '#95a5a6' 
-             for x in sentiment_counts.index]
-    axes[0, 0].pie(sentiment_counts.values, labels=sentiment_counts.index, autopct='%1.1f%%', 
-                  colors=colors, startangle=90)
-    axes[0, 0].set_title('Overall Sentiment Distribution', fontsize=12, fontweight='bold')
-    
-    if 'scraping_method' in df.columns and len(df['scraping_method'].unique()) > 1:
-        method_counts = df['scraping_method'].value_counts()
-        colors_method = ['#3498db', '#e74c3c'][:len(method_counts)]
-        bars = axes[0, 1].bar(method_counts.index, method_counts.values, color=colors_method)
-        axes[0, 1].set_title('Articles by Scraping Method', fontsize=12, fontweight='bold')
-        axes[0, 1].set_xlabel('Scraping Method')
-        axes[0, 1].set_ylabel('Article Count')
-        
-        for bar in bars:
-            height = bar.get_height()
-            axes[0, 1].text(bar.get_x() + bar.get_width()/2., height + 1,
-                           f'{int(height)}', ha='center', va='bottom', fontsize=10)
-    
-    if 'scraping_method' in df.columns and len(df['scraping_method'].unique()) > 1:
-        method_sentiment = pd.crosstab(df['scraping_method'], df['sentiment_label'])
-        method_sentiment.plot(kind='bar', ax=axes[0, 2], color=['#ff6b6b', '#95a5a6', '#4ecdc4'])
-        axes[0, 2].set_title('Sentiment by Scraping Method', fontsize=12, fontweight='bold')
-        axes[0, 2].set_xlabel('Scraping Method')
-        axes[0, 2].set_ylabel('Article Count')
-        axes[0, 2].legend(title='Sentiment')
-        axes[0, 2].tick_params(axis='x', rotation=45)
-    
-    if len(df['source'].unique()) > 1:
         source_counts = df['source'].value_counts()
+        axes[0, 1].bar(source_counts.index, source_counts.values, color='#3498db')
+        axes[0, 1].set_title('📰 Articles by Source')
+        axes[0, 1].tick_params(axis='x', rotation=45)
         
-        selenium_sources = ['ap', 'cnn']
-        colors_source = ['#3498db' if source in selenium_sources else '#e74c3c' 
-                        for source in source_counts.index]
+        category_counts = df['category'].value_counts().head(8)
+        axes[0, 2].barh(category_counts.index, category_counts.values, color='#9b59b6')
+        axes[0, 2].set_title('📈 Articles by Category')
         
-        bars = axes[1, 0].bar(source_counts.index, source_counts.values, color=colors_source)
-        axes[1, 0].set_title('Collection Success by Source', fontsize=12, fontweight='bold')
-        axes[1, 0].set_xlabel('News Source')
-        axes[1, 0].set_ylabel('Article Count')
-        axes[1, 0].tick_params(axis='x', rotation=45)
+        df_recent = df[df['scraped_at'] >= df['scraped_at'].max() - pd.Timedelta(days=7)]
+        if not df_recent.empty:
+            daily_sentiment = df_recent.groupby(df_recent['scraped_at'].dt.date)['sentiment_score'].mean()
+            axes[1, 0].plot(daily_sentiment.index, daily_sentiment.values, marker='o', color='#e67e22', linewidth=2)
+            axes[1, 0].set_title('📅 Daily Sentiment Trend (Last 7 Days)')
+            axes[1, 0].tick_params(axis='x', rotation=45)
+            axes[1, 0].axhline(y=0, color='gray', linestyle='--', alpha=0.7)
         
-        selenium_patch = plt.Rectangle((0,0),1,1,fc='#3498db', label='Selenium')
-        requests_patch = plt.Rectangle((0,0),1,1,fc='#e74c3c', label='Requests')
-        axes[1, 0].legend(handles=[selenium_patch, requests_patch])
+        source_sentiment = df.groupby('source')['sentiment_score'].mean()
+        bars = axes[1, 1].bar(source_sentiment.index, source_sentiment.values)
+        axes[1, 1].set_title('🎯 Average Sentiment by Source')
+        axes[1, 1].tick_params(axis='x', rotation=45)
+        axes[1, 1].axhline(y=0, color='gray', linestyle='--', alpha=0.7)
         
-        for bar in bars:
-            height = bar.get_height()
-            axes[1, 0].text(bar.get_x() + bar.get_width()/2., height + 0.5,
-                           f'{int(height)}', ha='center', va='bottom', fontsize=9)
+        for bar, score in zip(bars, source_sentiment.values):
+            color = '#2ecc71' if score > 0 else '#e74c3c' if score < 0 else '#95a5a6'
+            bar.set_color(color)
+        
+        content_lengths = df['content_length'].hist(bins=30, ax=axes[1, 2], color='#1abc9c', alpha=0.7)
+        axes[1, 2].set_title('📝 Content Length Distribution')
+        axes[1, 2].set_xlabel('Content Length (characters)')
+        axes[1, 2].set_ylabel('Frequency')
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"📊 Dashboard saved as '{save_path}'")
+        
+        return fig
     
-    if 'scraping_method' in df.columns:
-        df['content_length'] = df['content'].str.len()
-        method_quality = df.groupby('scraping_method')['content_length'].mean()
-        bars = axes[1, 1].bar(method_quality.index, method_quality.values, 
-                             color=['#3498db', '#e74c3c'][:len(method_quality)])
-        axes[1, 1].set_title('Content Quality by Method', fontsize=12, fontweight='bold')
-        axes[1, 1].set_xlabel('Scraping Method')
-        axes[1, 1].set_ylabel('Average Content Length')
+    def create_wordcloud(self, df: pd.DataFrame, sentiment: str = 'all', save_path: str = None):
+        if not WORDCLOUD_AVAILABLE:
+            print("WordCloud not available. Install with: pip install wordcloud")
+            return
         
-        for bar in bars:
-            height = bar.get_height()
-            axes[1, 1].text(bar.get_x() + bar.get_width()/2., height + 50,
-                           f'{int(height)}', ha='center', va='bottom', fontsize=10)
-    
-    axes[1, 2].hist(df['sentiment_score'], bins=25, alpha=0.7, color='#3498db', edgecolor='black')
-    axes[1, 2].axvline(df['sentiment_score'].mean(), color='red', linestyle='--', 
-                      label=f'Mean: {df["sentiment_score"].mean():.3f}')
-    axes[1, 2].set_title('Sentiment Score Distribution', fontsize=12, fontweight='bold')
-    axes[1, 2].set_xlabel('Sentiment Score')
-    axes[1, 2].set_ylabel('Frequency')
-    axes[1, 2].legend()
-    
-    if len(df['category'].unique()) > 1:
-        category_sentiment = pd.crosstab(df['category'], df['sentiment_label'])
-        category_sentiment.plot(kind='bar', ax=axes[2, 0], color=['#ff6b6b', '#95a5a6', '#4ecdc4'])
-        axes[2, 0].set_title('Sentiment by Category', fontsize=12, fontweight='bold')
-        axes[2, 0].set_xlabel('Category')
-        axes[2, 0].set_ylabel('Article Count')
-        axes[2, 0].tick_params(axis='x', rotation=45)
-        axes[2, 0].legend(title='Sentiment')
-    
-    df['scraped_date'] = pd.to_datetime(df['scraped_at']).dt.date
-    if len(df['scraped_date'].unique()) > 1:
-        timeline_data = df.groupby(['scraped_date', 'sentiment_label']).size().unstack(fill_value=0)
-        timeline_data.plot(ax=axes[2, 1], color=['#ff6b6b', '#95a5a6', '#4ecdc4'], 
-                          linewidth=2, marker='o')
-        axes[2, 1].set_title('Sentiment Timeline', fontsize=12, fontweight='bold')
-        axes[2, 1].set_xlabel('Date')
-        axes[2, 1].set_ylabel('Article Count')
-        axes[2, 1].legend(title='Sentiment')
-        axes[2, 1].grid(True, alpha=0.3)
-    
-    if len(df['source'].unique()) > 1:
-        avg_sentiment = df.groupby('source')['sentiment_score'].mean().sort_values(ascending=True)
+        if df.empty:
+            print("No data available for word cloud")
+            return
         
-        selenium_sources = ['ap', 'cnn']
-        colors_bar = ['#3498db' if source in selenium_sources else '#e74c3c' 
-                     for source in avg_sentiment.index]
+        if sentiment != 'all':
+            df = df[df['sentiment_label'] == sentiment]
         
-        bars = axes[2, 2].barh(avg_sentiment.index, avg_sentiment.values, color=colors_bar)
-        axes[2, 2].set_title('Average Sentiment by Source', fontsize=12, fontweight='bold')
-        axes[2, 2].set_xlabel('Average Sentiment Score')
-        axes[2, 2].axvline(0, color='black', linestyle='-', alpha=0.5)
+        if df.empty:
+            print(f"No articles found for sentiment: {sentiment}")
+            return
         
-        for i, bar in enumerate(bars):
-            width = bar.get_width()
-            axes[2, 2].text(width + (0.01 if width >= 0 else -0.01), 
-                           bar.get_y() + bar.get_height()/2,
-                           f'{width:.3f}', ha='left' if width >= 0 else 'right', 
-                           va='center', fontsize=9)
-    
-    if 'scraping_method' in df.columns and len(df['scraping_method'].unique()) > 1:
-        method_sentiment_avg = df.groupby('scraping_method')['sentiment_score'].agg(['mean', 'std'])
+        text = ' '.join(df['title'].fillna('') + ' ' + df['content'].fillna(''))
         
-        x_pos = range(len(method_sentiment_avg))
-        bars = axes[3, 0].bar(x_pos, method_sentiment_avg['mean'], 
-                             yerr=method_sentiment_avg['std'], 
-                             color=['#3498db', '#e74c3c'][:len(method_sentiment_avg)],
-                             capsize=5, alpha=0.7)
-        
-        axes[3, 0].set_title('Sentiment Analysis: Method Comparison', fontsize=12, fontweight='bold')
-        axes[3, 0].set_xlabel('Scraping Method')
-        axes[3, 0].set_ylabel('Average Sentiment Score')
-        axes[3, 0].set_xticks(x_pos)
-        axes[3, 0].set_xticklabels(method_sentiment_avg.index)
-        axes[3, 0].axhline(0, color='black', linestyle='-', alpha=0.5)
-        
-        for i, bar in enumerate(bars):
-            height = bar.get_height()
-            axes[3, 0].text(bar.get_x() + bar.get_width()/2., height + 0.01,
-                           f'{height:.3f}', ha='center', va='bottom', fontsize=10)
-    
-    if 'scraping_method' in df.columns:
-        selenium_sources = ['ap', 'cnn']
-        requests_sources = ['bbc', 'guardian']
-        
-        selenium_success = len([s for s in selenium_sources if s in df['source'].values])
-        requests_success = len([s for s in requests_sources if s in df['source'].values])
-        
-        success_data = ['Selenium', 'Requests']
-        success_counts = [selenium_success, requests_success]
-        success_rates = [s/2.0 for s in success_counts]
-        
-        bars = axes[3, 1].bar(success_data, success_rates, color=['#3498db', '#e74c3c'])
-        axes[3, 1].set_title('Method Success Rate', fontsize=12, fontweight='bold')
-        axes[3, 1].set_ylabel('Success Rate (Sources Working)')
-        axes[3, 1].set_ylim(0, 1)
-        
-        for bar, rate in zip(bars, success_rates):
-            height = bar.get_height()
-            axes[3, 1].text(bar.get_x() + bar.get_width()/2., height + 0.02,
-                           f'{rate:.1%}', ha='center', va='bottom', fontsize=10)
-    
-    all_keywords = []
-    for keywords_str in df['keywords'].dropna():
         try:
-            keywords = json.loads(keywords_str)
-            all_keywords.extend(keywords)
-        except:
-            continue
-    
-    if all_keywords:
-        if WORDCLOUD_AVAILABLE:
-            keyword_freq = Counter(all_keywords)
-            wordcloud = WordCloud(width=400, height=300, background_color='white', 
-                                colormap='viridis', max_words=50).generate_from_frequencies(keyword_freq)
-            axes[3, 2].imshow(wordcloud, interpolation='bilinear')
-            axes[3, 2].axis('off')
-            axes[3, 2].set_title('Keywords Cloud', fontsize=12, fontweight='bold')
-        else:
-            keyword_freq = Counter(all_keywords)
-            top_keywords = dict(keyword_freq.most_common(10))
-            bars = axes[3, 2].barh(list(top_keywords.keys()), list(top_keywords.values()), 
-                                  color='#2ecc71', alpha=0.7)
-            axes[3, 2].set_title('Top 10 Keywords', fontsize=12, fontweight='bold')
-            axes[3, 2].set_xlabel('Frequency')
-    else:
-        axes[3, 2].text(0.5, 0.5, 'No keywords available\nRun scraping first', 
-                       ha='center', va='center', transform=axes[3, 2].transAxes)
-        axes[3, 2].set_title('Keywords Analysis', fontsize=12, fontweight='bold')
-    
-    plt.tight_layout()
-    plt.savefig('mixed_method_sentiment_dashboard.png', dpi=300, bbox_inches='tight')
-    plt.show()
-    
-    print("Mixed method dashboard saved as 'mixed_method_sentiment_dashboard.png'")
-
-def export_enhanced_tableau_data():
-    conn = sqlite3.connect('enhanced_news_articles.db')
-    df = pd.read_sql_query('SELECT * FROM articles ORDER BY scraped_at DESC', conn)
-    conn.close()
-    
-    if len(df) == 0:
-        print("No data found. Run mixed method scraping first.")
-        return
-    
-    if not os.path.exists('mixed_method_tableau_data'):
-        os.makedirs('mixed_method_tableau_data')
-    
-    df['sentiment_category'] = df['sentiment_score'].apply(lambda x: 
-        "Very Positive" if x >= 0.3 else
-        "Positive" if x >= 0.1 else
-        "Neutral" if x >= -0.1 else
-        "Negative" if x >= -0.3 else
-        "Very Negative")
-    
-    df['content_length'] = df['content'].str.len()
-    df['scraped_date'] = pd.to_datetime(df['scraped_at']).dt.date
-    df['scraped_hour'] = pd.to_datetime(df['scraped_at']).dt.hour
-    df['day_of_week'] = pd.to_datetime(df['scraped_at']).dt.day_name()
-    
-    region_mapping = {
-        'bbc': 'UK/Europe', 'ap': 'International', 'guardian': 'UK/Europe',
-        'cnn': 'North America'
-    }
-    df['region'] = df['source'].map(region_mapping)
-    
-    selenium_sources = ['ap', 'cnn']
-    df['method_category'] = df['source'].apply(
-        lambda x: 'Selenium' if x in selenium_sources else 'Requests'
-    )
-    
-    df.to_csv('mixed_method_tableau_data/mixed_method_news_sentiment_data.csv', index=False)
-    
-    method_comparison = df.groupby(['scraping_method', 'source']).agg({
-        'sentiment_score': ['mean', 'std', 'count'],
-        'content_length': 'mean'
-    }).reset_index()
-    method_comparison.columns = ['_'.join(col).strip() for col in method_comparison.columns.values]
-    method_comparison.to_csv('mixed_method_tableau_data/method_comparison_data.csv', index=False)
-    
-    print(f"Mixed Method Tableau datasets exported:")
-    print(f"   - mixed_method_news_sentiment_data.csv: {len(df)} rows")
-    print(f"   - method_comparison_data.csv: {len(method_comparison)} rows")
-    print(f"   - Sources covered: {', '.join(df['source'].unique())}")
-    print(f"   - Selenium sources: {len(df[df['method_category'] == 'Selenium']['source'].unique())}")
-    print(f"   - Requests sources: {len(df[df['method_category'] == 'Requests']['source'].unique())}")
-
-def generate_enhanced_market_report():
-    conn = sqlite3.connect('enhanced_news_articles.db')
-    df = pd.read_sql_query('SELECT * FROM articles ORDER BY scraped_at DESC', conn)
-    conn.close()
-    
-    if len(df) == 0:
-        print("No data found for market report.")
-        return
-    
-    market_df = df[df['category'].isin(['business', 'technology', 'world'])]
-    
-    if len(market_df) == 0:
-        print("No market-related articles found.")
-        return
-    
-    market_sentiment = market_df['sentiment_score'].mean()
-    
-    print("MIXED METHOD MARKET SENTIMENT INTELLIGENCE REPORT")
-    print(f"Overall Market Sentiment Score: {market_sentiment:.3f}")
-    
-    classification = (
-        "Very Positive" if market_sentiment >= 0.2 else
-        "Positive" if market_sentiment >= 0.05 else
-        "Neutral" if market_sentiment >= -0.05 else
-        "Negative" if market_sentiment >= -0.2 else
-        "Very Negative"
-    )
-    print(f"Classification: {classification}")
-    
-    print(f"Articles Analyzed: {len(market_df)}")
-    print(f"Sources: {', '.join(market_df['source'].unique())}")
-    
-    if 'scraping_method' in market_df.columns:
-        selenium_df = market_df[market_df['scraping_method'] == 'selenium']
-        requests_df = market_df[market_df['scraping_method'] == 'requests']
-        
-        print("METHOD BREAKDOWN:")
-        if len(selenium_df) > 0:
-            selenium_sentiment = selenium_df['sentiment_score'].mean()
-            print(f"   Selenium: {selenium_sentiment:.3f} sentiment ({len(selenium_df)} articles)")
-        if len(requests_df) > 0:
-            requests_sentiment = requests_df['sentiment_score'].mean()
-            print(f"   Requests: {requests_sentiment:.3f} sentiment ({len(requests_df)} articles)")
-    
-    print("SOURCE BREAKDOWN:")
-    selenium_sources = ['ap', 'cnn']
-    for source in market_df['source'].unique():
-        source_df = market_df[market_df['source'] == source]
-        source_sentiment = source_df['sentiment_score'].mean()
-        method_name = "Selenium" if source in selenium_sources else "Requests"
-        print(f"   {source.upper()} ({method_name}): {source_sentiment:.3f} ({len(source_df)} articles)")
-    
-    print("CATEGORY BREAKDOWN:")
-    for category in market_df['category'].unique():
-        cat_df = market_df[market_df['category'] == category]
-        cat_sentiment = cat_df['sentiment_score'].mean()
-        print(f"   {category.capitalize()}: {cat_sentiment:.3f} ({len(cat_df)} articles)")
-    
-    interpretation_parts = []
-    if market_sentiment >= 0.1:
-        interpretation_parts.append("Strong positive market sentiment detected.")
-        interpretation_parts.append("Consider bullish market positions.")
-    elif market_sentiment <= -0.1:
-        interpretation_parts.append("Concerning negative sentiment revealed.")
-        interpretation_parts.append("Consider defensive strategies.")
-    else:
-        interpretation_parts.append("Neutral market sentiment indicated.")
-        interpretation_parts.append("Monitor closely for directional signals.")
-    
-    if 'scraping_method' in market_df.columns and len(selenium_df) > 0 and len(requests_df) > 0:
-        if abs(selenium_sentiment - requests_sentiment) > 0.1:
-            if selenium_sentiment > requests_sentiment:
-                interpretation_parts.append(f"Selenium sources show more positive sentiment ({selenium_sentiment:.3f} vs {requests_sentiment:.3f}).")
+            if NLTK_AVAILABLE:
+                stop_words = set(stopwords.words('english'))
             else:
-                interpretation_parts.append(f"Requests sources show more positive sentiment ({requests_sentiment:.3f} vs {selenium_sentiment:.3f}).")
-        else:
-            interpretation_parts.append("Both scraping methods show consistent sentiment readings.")
+                stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
+        except:
+            stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
+        
+        wordcloud = WordCloud(
+            width=1200, height=600,
+            background_color='white',
+            stopwords=stop_words,
+            max_words=100,
+            colormap='viridis',
+            relative_scaling=0.5,
+            random_state=42
+        ).generate(text)
+        
+        plt.figure(figsize=(15, 8))
+        plt.imshow(wordcloud, interpolation='bilinear')
+        plt.axis('off')
+        plt.title(f'Word Cloud - {sentiment.title() if sentiment != "all" else "All"} Sentiment', 
+                 fontsize=16, fontweight='bold', pad=20)
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"💭 Word cloud saved as '{save_path}'")
+        
+        plt.show()
+        return wordcloud
     
-    print("Enhanced Interpretation:")
-    for part in interpretation_parts:
-        print(f"   {part}")
+    def generate_summary_report(self, df: pd.DataFrame) -> str:
+        if df.empty:
+            return "No articles found in database."
+        
+        trends = self.analyze_sentiment_trends(df)
+        
+        report = f"""
+📰 NEWS SENTIMENT ANALYSIS REPORT
+{'='*50}
+
+📊 OVERVIEW:
+   Total Articles: {trends['total_articles']:,}
+   Date Range: {trends['date_range']['start'].strftime('%Y-%m-%d')} to {trends['date_range']['end'].strftime('%Y-%m-%d')}
+   Average Content Length: {trends['avg_content_length']:.0f} characters
+
+😊 SENTIMENT DISTRIBUTION:
+"""
+        
+        for sentiment, count in trends['sentiment_distribution'].items():
+            percentage = (count / trends['total_articles']) * 100
+            emoji = {'positive': '😊', 'negative': '😔', 'neutral': '😐'}.get(sentiment, '❓')
+            report += f"   {emoji} {sentiment.title()}: {count:,} ({percentage:.1f}%)\n"
+        
+        report += f"\n📰 TOP SOURCES BY SENTIMENT:\n"
+        source_sentiment_sorted = trends['source_sentiment'].sort_values(ascending=False)
+        for source, avg_sentiment in source_sentiment_sorted.items():
+            emoji = '😊' if avg_sentiment > 0.1 else '😔' if avg_sentiment < -0.1 else '😐'
+            report += f"   {emoji} {source.upper()}: {avg_sentiment:.3f}\n"
+        
+        report += f"\n📈 CATEGORY INSIGHTS:\n"
+        category_sentiment_sorted = trends['category_sentiment'].sort_values(ascending=False)
+        for category, avg_sentiment in category_sentiment_sorted.items():
+            emoji = '😊' if avg_sentiment > 0.1 else '😔' if avg_sentiment < -0.1 else '😐'
+            report += f"   {emoji} {category.title()}: {avg_sentiment:.3f}\n"
+        
+        overall_sentiment = df['sentiment_score'].mean()
+        market_mood = "🚀 BULLISH" if overall_sentiment > 0.1 else "📉 BEARISH" if overall_sentiment < -0.1 else "⚖️ NEUTRAL"
+        
+        report += f"""
+🎯 MARKET SENTIMENT ANALYSIS:
+   Overall Score: {overall_sentiment:.3f}
+   Market Classification: {market_mood}
+   
+💡 INSIGHTS:
+   Most Positive Source: {source_sentiment_sorted.index[0].upper()} ({source_sentiment_sorted.iloc[0]:.3f})
+   Most Negative Source: {source_sentiment_sorted.index[-1].upper()} ({source_sentiment_sorted.iloc[-1]:.3f})
+   Most Covered Category: {df['category'].value_counts().index[0].title()} ({df['category'].value_counts().iloc[0]} articles)
+"""
+        
+        return report
+    
+    def close(self):
+        if hasattr(self, 'conn'):
+            self.conn.close()
+
 
 def main():
-    print("MIXED METHOD GLOBAL NEWS SENTIMENT SYSTEM")
-    print("Features:")
-    print("   Mixed Selenium + Requests approach")
-    print("   Enhanced error recovery")
-    print("   Method performance comparison")
-    print("SELENIUM SOURCES (Dynamic Content):")
-    print("   AP, CNN")
-    print("REQUESTS SOURCES (Static Content):")
-    print("   BBC, Guardian")
+    scraper = FastSeleniumNewsScraper(max_articles_per_source=60, headless=True, max_workers=6)
     
-    while True:
-        print("Choose an option:")
-        print("1. Mixed method news scraping (Selenium + Requests)")
-        print("2. Analyze sentiment with method comparison")
-        print("3. Generate mixed method visualizations")
-        print("4. Export data for Tableau Public")
-        print("5. Market intelligence report")
-        print("6. Method performance analysis")
-        print("7. Exit")
+    try:
+        print("🚀 Starting comprehensive news sentiment analysis...")
+        articles = scraper.scrape_all_sources_fast()
         
-        choice = input("Enter your choice (1-7): ").strip()
-        
-        if choice == '1':
-            print("Starting MIXED METHOD news scraping...")
+        if articles:
+            print(f"\n🎉 SUCCESS! Collected {len(articles)} articles!")
+            print("✓ Data saved to database")
+            print("✓ Ready for analysis")
+            
+            analyzer = SeleniumSentimentAnalyzer()
             
             try:
-                scraper = EnhancedNewsScraper(max_articles_per_source=20)
-                articles = scraper.scrape_all_sources()
+                df = analyzer.get_articles_from_db(limit=1000)
                 
-                if len(articles) > 0:
-                    selenium_count = len([a for a in articles if a.scraping_method == 'selenium'])
-                    requests_count = len([a for a in articles if a.scraping_method == 'requests'])
+                if not df.empty:
+                    print(f"\n📊 Creating visualizations...")
+                    analyzer.create_visualizations(df)
                     
-                    print(f"SUCCESS! {len(articles)} articles collected!")
-                    print(f"Selenium articles: {selenium_count}")
-                    print(f"Requests articles: {requests_count}")
+                    print(f"\n📋 Generating summary report...")
+                    report = analyzer.generate_summary_report(df)
+                    print(report)
                 else:
-                    print("No articles collected. Check internet connection and dependencies.")
+                    print("⚠️  No articles found in database for analysis")
                     
             except Exception as e:
-                print(f"Error during mixed method scraping: {str(e)}")
-        
-        elif choice == '2':
-            print("Analyzing sentiment with method comparison...")
-            
-            try:
-                analyzer = EnhancedSentimentAnalyzer()
-                df = analyzer.load_articles()
-                
-                if len(df) == 0:
-                    print("No articles found. Please run mixed method scraping first.")
-                    continue
-                    
-                print(f"MIXED METHOD NEWS ANALYSIS")
-                print(f"Total articles: {len(df)}")
-                print(f"Sources: {', '.join(df['source'].unique())}")
-                print(f"Date range: {df['scraped_at'].min()} to {df['scraped_at'].max()}")
-                
-                if 'scraping_method' in df.columns:
-                    method_counts = df['scraping_method'].value_counts()
-                    print("METHOD BREAKDOWN:")
-                    for method, count in method_counts.items():
-                        percentage = (count / len(df)) * 100
-                        print(f"   {method.capitalize()}: {count} articles ({percentage:.1f}%)")
-                
-                distribution = analyzer.sentiment_distribution()
-                print("OVERALL SENTIMENT:")
-                for sentiment, count in distribution['overall'].items():
-                    percentage = (count / len(df)) * 100
-                    print(f"   {sentiment.capitalize()}: {count} ({percentage:.1f}%)")
-                
-                method_comparison = analyzer.cross_method_comparison()
-                if method_comparison:
-                    print("METHOD PERFORMANCE COMPARISON:")
-                    for method, data in method_comparison.items():
-                        print(f"   {method.upper()}:")
-                        print(f"      Articles: {data['total_articles']}")
-                        print(f"      Avg Sentiment: {data['avg_sentiment']:.3f}")
-                        print(f"      Avg Content Length: {data['avg_content_length']:.0f} chars")
-                        print(f"      Source Coverage: {data['source_coverage']}/2 ({data['success_rate']:.1%})")
-                
-                print("SOURCE PERFORMANCE:")
-                selenium_sources = ['ap', 'cnn']
-                for source in sorted(df['source'].unique()):
-                    source_df = df[df['source'] == source]
-                    method = "Selenium" if source in selenium_sources else "Requests"
-                    avg_sentiment = source_df['sentiment_score'].mean()
-                    print(f"   {source.upper()} ({method}): {avg_sentiment:.3f} sentiment ({len(source_df)} articles)")
-                
-                topics = analyzer.trending_topics()
-                if topics:
-                    print("TOP 10 TRENDING TOPICS:")
-                    for i, (topic, count) in enumerate(topics[:10], 1):
-                        print(f"   {i:2d}. {topic} ({count} mentions)")
-                        
-                analyzer.conn.close()
-                
-            except Exception as e:
-                print(f"Error during analysis: {str(e)}")
-                
-        elif choice == '3':
-            print("Generating mixed method visualizations...")
-            try:
-                conn = sqlite3.connect('enhanced_news_articles.db')
-                df = pd.read_sql_query('SELECT * FROM articles ORDER BY scraped_at DESC', conn)
-                conn.close()
-                
-                if len(df) == 0:
-                    print("No articles found. Please run mixed method scraping first.")
-                    continue
-                
-                create_enhanced_dashboard(df)
-                
-            except Exception as e:
-                print(f"Error generating visualizations: {str(e)}")
-            
-        elif choice == '4':
-            print("Exporting mixed method data for Tableau Public...")
-            try:
-                export_enhanced_tableau_data()
-                
-            except Exception as e:
-                print(f"Error exporting data: {str(e)}")
-            
-        elif choice == '5':
-            print("Generating Mixed Method Market Intelligence Report...")
-            try:
-                generate_enhanced_market_report()
-                
-            except Exception as e:
-                print(f"Error generating market report: {str(e)}")
-        
-        elif choice == '6':
-            print("Method Performance Analysis...")
-            try:
-                analyzer = EnhancedSentimentAnalyzer()
-                df = analyzer.load_articles()
-                
-                if len(df) == 0:
-                    print("No articles found. Run mixed method scraping first.")
-                    continue
-                
-                method_analysis = analyzer.method_performance_analysis()
-                
-                print("SCRAPING METHOD PERFORMANCE ANALYSIS")
-                
-                for method, data in method_analysis.items():
-                    print(f"{method.upper()} METHOD:")
-                    print(f"   Total Articles: {data['article_count']}")
-                    print(f"   Average Content Length: {data['avg_content_length']:.0f} characters")
-                    print(f"   Average Sentiment: {data['avg_sentiment']:.3f}")
-                    print(f"   Sentiment Consistency: {data['sentiment_std']:.3f}")
-                    print(f"   Sources Successfully Scraped: {len(data['sources'])}/2 ({data['success_rate']:.1%})")
-                    print(f"   Sources: {', '.join(data['sources'])}")
-                
-                print("RECOMMENDATIONS:")
-                if len(method_analysis) >= 2:
-                    methods = list(method_analysis.keys())
-                    if method_analysis[methods[0]]['avg_content_length'] > method_analysis[methods[1]]['avg_content_length']:
-                        better_content = methods[0]
-                    else:
-                        better_content = methods[1]
-                    
-                    if method_analysis[methods[0]]['success_rate'] > method_analysis[methods[1]]['success_rate']:
-                        better_success = methods[0]
-                    else:
-                        better_success = methods[1]
-                    
-                    print(f"   {better_content.capitalize()} provides better content quality")
-                    print(f"   {better_success.capitalize()} has higher success rate")
-                    print("   Mixed approach provides best overall coverage")
-                
-                analyzer.conn.close()
-                
-            except Exception as e:
-                print(f"Error in method performance analysis: {str(e)}")
-            
-        elif choice == '7':
-            print("Thank you for using the Mixed Method News Sentiment System!")
-            break
-            
+                print(f"⚠️  Analysis error: {str(e)}")
+            finally:
+                analyzer.close()
         else:
-            print("Invalid choice. Please enter a number between 1-7.")
+            print("❌ No articles were collected")
+            
+    except Exception as e:
+        print(f"❌ Scraping failed: {str(e)}")
+        scraper.logger.error(f"Main execution failed: {str(e)}")
+    finally:
+        scraper.cleanup()
 
 if __name__ == "__main__":
-
     main()
